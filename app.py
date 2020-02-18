@@ -1,31 +1,20 @@
 # API Specific
-from flask import Flask, request, make_response, jsonify
-import json
+from flask import Flask, request, make_response
 import flask
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 #Model Specific
-import numpy
 import numpy as np
 import cv2
-import custom
-import custom_multiclass
-from mrcnn import model as modellib, utils
-from matplotlib import patches,  lines
 import os
-import sys
-import json
-import datetime
-import numpy as np
-import skimage.draw
-from mrcnn.config import Config
 import skimage
 from mrcnn import visualize
-import imageio
 from PIL import Image
 import io
 import base64
+from models import ScratchModel, DentModel, PartsModel
+import keras.backend as K
+import tensorflow as tf
+import time
 
 #GCP specific
 import uuid
@@ -41,10 +30,6 @@ bucket = client.get_bucket('damaged-car-images')
 app = Flask(__name__)
 ROOT_DIR = os.getcwd()
 
-config_damage = custom.CustomConfig()
-config_parts = custom_multiclass.CustomConfig()
-MODEL_DIR = os.path.join(ROOT_DIR, "logs/")
-
 parts = {
     1: "rear_bumper",
     2: "front_bumper",
@@ -52,17 +37,6 @@ parts = {
     4: "door",
     5: "hood"
 }
-
-class InferenceConfigDamage(config_damage.__class__):
-  GPU_COUNT = 1
-  IMAGES_PER_GPU = 1
-
-class InferenceConfigParts(config_parts.__class__):
-    GPU_COUNT = 1
-    IMAGES_PER_GPU = 1
-
-config_damage = InferenceConfigDamage()
-config_parts= InferenceConfigParts()
 
 def display_instances(image, boxes, masks, class_ids):
     masked_image = image.copy()
@@ -91,14 +65,31 @@ def map_part_to_damage(damage, parts):
     damage = (np.sum(damage, -1, keepdims=True) >= 1)
     return np.array([andOperation(parts[...,i],damage[...,0]) for i in range(parts.shape[-1])])
 
+def detect(model_type, image):
+    if(model_type=='scratch'):
+        K.set_session(ScratchModel.session)
+        with ScratchModel.session.as_default():
+            with ScratchModel.graph.as_default():
+                ScratchModel.session.run(tf.global_variables_initializer())
+                r=ScratchModel.scratch_model.detect([image], verbose=1)[0]
+        return r
+    elif(model_type == 'dent'):
+        K.set_session(DentModel.session)
+        with DentModel.session.as_default():
+            with DentModel.graph.as_default():
+                DentModel.session.run(tf.global_variables_initializer())
+                r=DentModel.dent_model.detect([image], verbose=1)[0]
+        return r
+    else:
+        K.set_session(PartsModel.session)
+        with PartsModel.session.as_default():
+            with PartsModel.graph.as_default():
+                PartsModel.session.run(tf.global_variables_initializer())
+                r=PartsModel.parts_model.detect([image], verbose=1)[0]
+        return r
 
-def detect(weights, image, config):
-	model = modellib.MaskRCNN(mode="inference", config=config,
-                                  model_dir=MODEL_DIR)
-	model_WEIGHTS_PATH = os.path.join(MODEL_DIR, weights)
-	model.load_weights(model_WEIGHTS_PATH, by_name=True)
-	r = model.detect([image], verbose=1)[0]
-	return r
+
+
 
 def array_to_image(arr):
     im = Image.fromarray(arr.astype("uint8"))
@@ -122,17 +113,18 @@ def image_to_gcp(image):
 
 @app.route("/api", methods=['POST'])
 def api():
+    start_time = time.time()
     args = request.files.get('image')
     image = skimage.io.imread(args)
 
-    r_dent = detect('damage20200116T1049/mask_rcnn_damage_0020.h5',image, config_damage)
-    r_scratch = detect('damage20200117T1031/mask_rcnn_damage_0020.h5',image, config_damage)
+    r_dent = detect('dent', image)
+    r_scratch =  detect('scratch', image)
     rois = np.concatenate((r_dent['rois'], r_scratch['rois']))
     masks = np.concatenate((r_dent['masks'], r_scratch['masks']), axis=2)
     class_ids = np.concatenate((r_dent['class_ids'], r_scratch['class_ids']))
     result = display_instances(image, rois, masks, class_ids)
 
-    r_parts = detect('part20200123T0432/mask_rcnn_part_0010.h5', image, config_parts)
+    r_parts = detect('parts', image)
     result_part = display_instances(image, r_parts['rois'], r_parts['masks'], r_parts['class_ids'])
     scratch_parts_masks = map_part_to_damage(r_scratch['masks'],r_parts['masks'])
     dent_parts_masks = map_part_to_damage(r_dent['masks'],r_parts['masks'])
@@ -152,14 +144,16 @@ def api():
                 severity.append('SCRATCH')
             dict['severity'] = severity
             resp.append(dict)
-    print(resp)
+
     damage_response = array_to_image(result)
     part_response = array_to_image(result_part)
+    damage_image= 'abcd'
+    part_image = 'abcd'
     damage_image = image_to_gcp(result)
     part_image = image_to_gcp(result_part)
-    
+    total_time ="--- %s seconds ---"% (time.time()- start_time)
     response = flask.make_response({'response': resp, 'damage_image': str(damage_response), 'part_image': str(part_response),
-                                    'damage_image_path': damage_image, 'part_image_path': part_image}, 200)
+                                    'damage_image_path': damage_image, 'part_image_path': part_image, 'time_taken': total_time}, 200)
     response.headers['Access-Control-Allow-Headers'] = 'Origin, X-Requested-With, Content-Type, Accept, Authorization'
     return response
 
